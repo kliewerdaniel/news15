@@ -33,7 +33,7 @@ class NewsGenerator:
         self.performance_monitor = PerformanceMonitor()
         self.topic = topic
         self.guidance = guidance
-        self.relevancy_threshold = 5
+        self.relevancy_threshold = CONFIG["relevancy"]["threshold"] # Use threshold from config
         self.logger = logging.getLogger(__name__)
 
         self.db = NewsDatabase()
@@ -49,6 +49,9 @@ class NewsGenerator:
         start_time = datetime.now()
 
         async with aiohttp.ClientSession() as session:
+            self.article_clusterer.session = session # Pass the session to the clusterer
+            self.article_clusterer.circuit_breaker = self.circuit_breaker # Pass the circuit breaker to the clusterer
+
             # Generate summaries
             summary_tasks = [self.generate_summary_safe(session, article) for article in articles]
             summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
@@ -76,7 +79,7 @@ class NewsGenerator:
         headlines = [article.title for article in articles]
         timestamp_source_info = [(article.published, article.source) for article in articles]
         
-        cluster_results = self.article_clusterer.process_batch(headlines, timestamp_source_info)
+        cluster_results = await self.article_clusterer.process_batch(headlines, timestamp_source_info)
 
         # Assign cluster_id back to articles
         for cluster_id, cluster_data in cluster_results.items():
@@ -111,7 +114,7 @@ class NewsGenerator:
                     'stream': False,
                     'options': {'temperature': 0.3, 'max_tokens': 10000}
                 },
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 response.raise_for_status()
                 data = await response.json()
@@ -155,7 +158,7 @@ class NewsGenerator:
                     'stream': False,
                     'options': {'temperature': 0.1, 'max_tokens': 5}
                 },
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 response.raise_for_status()
                 data = await response.json()
@@ -299,7 +302,7 @@ class NewsGenerator:
                         'stream': False,
                         'options': {'temperature': 0.4, 'max_tokens': 30000}
                     },
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=60)
                 ) as response:
                     response.raise_for_status()
                     data = await response.json()
@@ -328,7 +331,7 @@ class NewsGenerator:
                         'stream': False,
                         'options': {'temperature': 0.6, 'max_tokens': 50}
                     },
-                    timeout=aiohttp.ClientTimeout(total=15)
+                    timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
                     response.raise_for_status()
                     data = await response.json()

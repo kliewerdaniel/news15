@@ -88,7 +88,7 @@ Narrative Structure: {persona.get('narrative_structure', 'logical progression')}
 Write a news segment about {segment_topic}. Use this information:
 {context}
 
-Write 5-6 sentences in a concise, {persona.get('style', 'news anchor style')} style, focusing directly on the news. Avoid conversational filler phrases such as "meanwhile" or similar transition words.
+Write 7-10 sentences in a concise, {persona.get('style', 'news anchor style')} style, focusing directly on the news. Avoid conversational filler phrases such as "meanwhile" or similar transition words.
 """
 
     if guidance:
@@ -137,5 +137,5 @@ Narrative Structure: {persona.get('narrative_structure', 'logical progression')}
 
 Generate a short, smooth transition phrase (1-2 sentences) from a news segment about '{previous_topic}' to a new segment about '{current_topic}'.
 
-Avoid using the word 'meanwhile'. Focus on natural flow and clarity of connection.
+Avoid using the word 'meanwhile'. Focus on natural flow and clarity of connection. 
 """

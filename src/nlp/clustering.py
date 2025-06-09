@@ -5,10 +5,13 @@ from tqdm import tqdm
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from datetime import datetime
-from transformers import pipeline
+import aiohttp # Import aiohttp
 from sklearn.metrics import silhouette_score
 import time # Import time for sleep
+import traceback # Import traceback
 from src.core.config import CONFIG # Import CONFIG
+from src.core.circuit_breaker import CircuitBreaker # Import CircuitBreaker
+from src.prompts import create_summary_prompt, create_segment_script_prompt, create_transition_phrase_prompt # Import prompt functions
 
 class CSAIHistory:
     def __init__(self):
@@ -24,8 +27,8 @@ class StreamClusterer:
         self.csai_history = CSAIHistory()
         self.cluster_history = [] # Store cluster summaries and metadata
         self.geolocator = Nominatim(user_agent="news15", timeout=10) # Increased timeout
-        self.summarization_pipeline = pipeline("summarization")
-        self.topic_extraction_pipeline = pipeline("text-generation", model="facebook/bart-large-cnn")
+        self.session: aiohttp.ClientSession = None # Will be set by NewsGenerator
+        self.circuit_breaker: CircuitBreaker = None # Will be set by NewsGenerator
 
     def add_batch(self, headlines):
         if not headlines:
@@ -50,10 +53,10 @@ class StreamClusterer:
             clustered_headlines[label].append(headlines[i])
         return clustered_headlines
 
-    def postprocess_cluster(self, cluster_headlines, timestamp_source_info=None):
+    async def postprocess_cluster(self, cluster_headlines, timestamp_source_info=None):
         filtered_headlines = self.temporal_spatial_filter(cluster_headlines, timestamp_source_info)
-        cluster_summary = self.summarize_cluster(filtered_headlines)
-        cluster_topic = self.label_cluster_topic(cluster_summary)
+        cluster_summary = await self.summarize_cluster(filtered_headlines)
+        cluster_topic = await self.label_cluster_topic(cluster_summary)
 
         return {
             'summary': cluster_summary,
@@ -112,24 +115,94 @@ class StreamClusterer:
             filtered_headlines = headlines
         return filtered_headlines
 
-    def summarize_cluster(self, headlines):
+    async def summarize_cluster(self, headlines):
         if not headlines:
             return "No headlines to summarize"
         text = " ".join(headlines)
-        summary = self.summarization_pipeline(text, max_length=130, min_length=30, do_sample=False, truncation=True)[0]['summary_text']
-        return summary
 
-    def label_cluster_topic(self, cluster_summary):
+        if not self.session or not self.circuit_breaker.can_execute():
+            return "Summary unavailable (LLM service not configured or circuit breaker open)."
+
+        prompt = create_summary_prompt("Cluster Summary", text, None) # No persona for cluster summary
+
+        try:
+            async with self.session.post(
+                f"{CONFIG['ollama_api']['base_url']}/api/generate",
+                json={
+                    'model': CONFIG["models"]["summary_model"],
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {'temperature': 0.3, 'max_tokens': 500}
+                },
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                self.circuit_breaker.record_success()
+                return data['response'].strip()
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            print(f"ERROR - Cluster summary LLM API error (status: {e.status}): {error_detail}")
+            self.circuit_breaker.record_failure()
+            return "Summary unavailable due to LLM error."
+        except aiohttp.ClientError as e:
+            print(f"ERROR - Network error during cluster summary LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            return "Summary unavailable due to LLM error."
+        except Exception as e:
+            print(f"ERROR - Unexpected error during cluster summary LLM call: {e}")
+            traceback.print_exc() # Print the full traceback
+            self.circuit_breaker.record_failure()
+            return "Summary unavailable due to LLM error."
+
+    async def label_cluster_topic(self, cluster_summary):
+        if not cluster_summary or not self.session or not self.circuit_breaker.can_execute():
+            return "Topic unavailable (LLM service not configured or circuit breaker open)."
+
         prompt = f"What is the main topic of the following text? {cluster_summary}\n\nTopic:"
-        topic = self.topic_extraction_pipeline(prompt, max_length=50, min_length=5, do_sample=True, truncation=True)[0]['generated_text']
-        return topic
+        
+        try:
+            async with self.session.post(
+                f"{CONFIG['ollama_api']['base_url']}/api/generate",
+                json={
+                    'model': CONFIG["models"]["broadcast_model"], # Using broadcast model for topic extraction
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {'temperature': 0.6, 'max_tokens': 50}
+                },
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                self.circuit_breaker.record_success()
+                return data['response'].strip()
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            print(f"ERROR - Topic extraction LLM API error (status: {e.status}): {error_detail}")
+            self.circuit_breaker.record_failure()
+            return "Topic unavailable due to LLM error."
+        except aiohttp.ClientError as e:
+            print(f"ERROR - Network error during topic extraction LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            return "Topic unavailable due to LLM error."
+        except Exception as e:
+            print(f"ERROR - Unexpected error during topic LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            return "Topic unavailable due to LLM error."
 
     def validate_clustering(self, embeddings, labels):
-        silhouette = silhouette_score(embeddings, labels)
-        self.csai_history.append({'silhouette': silhouette})
-        return silhouette
+        # Only calculate silhouette score if there are at least two unique labels
+        # and more than one sample, otherwise it's undefined.
+        if len(np.unique(labels)) > 1 and len(embeddings) > 1:
+            silhouette = silhouette_score(embeddings, labels)
+            self.csai_history.append({'silhouette': silhouette})
+            return silhouette
+        else:
+            # If silhouette score cannot be calculated, append a placeholder or skip
+            self.csai_history.append({'silhouette': None})
+            return None
 
-    def process_batch(self, headlines, timestamp_source_info=None):
+    async def process_batch(self, headlines, timestamp_source_info=None):
         clustered_headlines = self.add_batch(headlines)
         cluster_results = {}
         embeddings = self.embedder.encode(headlines, convert_to_tensor=True).cpu().numpy()
@@ -149,7 +222,7 @@ class StreamClusterer:
                 except ValueError:
                     # This should not happen if headlines are correctly matched
                     pass
-            cluster_results[cluster_id] = self.postprocess_cluster(cluster_headlines_list, current_cluster_ts_info)
+            cluster_results[cluster_id] = await self.postprocess_cluster(cluster_headlines_list, current_cluster_ts_info)
 
         self.validate_clustering(embeddings, labels)
         self.cluster_history.append(cluster_results)

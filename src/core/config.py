@@ -6,11 +6,14 @@ CONFIG = {
         "embedding_model": "nomic-embed-text"
     },
     "processing": {
-        "max_articles_per_feed": 80,
-        "min_article_length": 100,
+        "max_articles_per_feed": 20,
+        "min_article_length": 50,
         "max_clusters": 50,
-        "target_segments": 2500,
+        "target_segments": 50000,
         "enable_spatial_filter": False # New configuration option
+    },
+    "relevancy": {
+        "threshold": 3 # Lowered default relevancy threshold
     },
     "output": {"max_broadcast_length": 900000000}
 }
